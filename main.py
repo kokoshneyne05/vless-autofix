@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Автоматический сборщик + реальный тестер публичных VLESS.
-Работает стабильно на GitHub Actions.
+VLESS Auto Collector + Hybrid Tester (2026)
+1. Быстрый TCP-фильтр
+2. Реальный тест (googleping) только выживших
+3. Если реальных 0 — берём лучшие по TCP (чтобы подписка не была пустой)
 """
 
 import urllib.request
@@ -13,197 +15,234 @@ import gzip
 import shutil
 import subprocess
 import glob
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ===================== НАСТРОЙКИ =====================
 SOURCES = [
     "https://github.com/kort0881/vpn-vless-configs-russia/raw/refs/heads/main/output/vless.txt",
-    # Можешь добавить ещё источники сюда (по одному на строку)
-    # "https://raw.githubusercontent.com/other/repo/main/vless.txt",
+    # Добавляй ещё источники сюда
 ]
 
-MAX_NODES_TO_TEST = 300          # Не тестируем больше 300 (иначе GHA таймаутится)
-CONCURRENCY = 8                  # Важно! Не ставь больше 10-12
-TEST_TIMEOUT_SECONDS = 420       # Максимум 7 минут на весь тест
-TOP_N = 20                       # Сколько лучших оставляем
+MAX_NODES_COLLECT = 800          # сколько максимум собираем
+MAX_NODES_REAL_TEST = 120        # сколько максимум пускаем в реальный тест
+TCP_TIMEOUT = 2.5                # секунд на TCP-проверку
+TCP_WORKERS = 80                 # потоков для TCP
+CONCURRENCY_REAL = 6             # concurrency для LiteSpeedTest (не ставь > 8)
+REAL_TEST_TIMEOUT = 380          # секунд на весь реальный тест
+TOP_N = 20
 # =====================================================
 
 
-def get_nodes(url: str) -> list[str]:
-    """Скачивает и очищает VLESS-ссылки из источника"""
+def get_nodes(url: str) -> list:
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=18) as resp:
             content = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
         print(f"[!] Ошибка загрузки {url}: {e}")
         return []
 
-    # Чистим типичный мусор
-    content = content.replace("&amp;", "&")
-    content = content.replace("%26", "&")
-
+    content = content.replace("&amp;", "&").replace("%26", "&")
     links = []
     for line in content.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Берём только саму ссылку (до | или пробела с мусором)
-        match = re.search(r"(vless://[^\s|]+)", line)
+        match = re.search(r"(vless://[^\s|\"']+)", line)
         if match:
-            link = match.group(1).rstrip(".,;")
-            # Убираем возможные обрезки в конце
-            if link.count("@") == 1 and "://" in link:
+            link = match.group(1).rstrip(".,; \t")
+            if link.count("@") == 1:
                 links.append(link)
-
     return links
+
+
+def parse_host_port(vless_link: str):
+    """Извлекает host:port из vless://uuid@host:port?..."""
+    try:
+        after = vless_link.split("@", 1)[1]
+        hostport = after.split("?", 1)[0].split("#", 1)[0]
+        if hostport.startswith("["):  # IPv6
+            host, port = hostport[1:].split("]:")
+            return host, int(port)
+        else:
+            host, port = hostport.rsplit(":", 1)
+            return host, int(port)
+    except Exception:
+        return None
+
+
+def tcp_check(link: str):
+    """Быстрая TCP-проверка. Возвращает (link, latency_ms) или None"""
+    parsed = parse_host_port(link)
+    if not parsed:
+        return None
+    host, port = parsed
+    start = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
+            latency = (time.perf_counter() - start) * 1000
+            return (link, latency)
+    except Exception:
+        return None
 
 
 def download_file(url: str, filename: str) -> bool:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as r, open(filename, "wb") as f:
+        with urllib.request.urlopen(req, timeout=40) as r, open(filename, "wb") as f:
             shutil.copyfileobj(r, f)
         return True
     except Exception as e:
-        print(f"[!] Не удалось скачать {url}: {e}")
+        print(f"[!] Не удалось скачать {filename}: {e}")
         return False
 
 
 def main():
     print("=" * 60)
-    print("VLESS Auto Collector + Real Tester")
+    print("VLESS Auto — Hybrid Tester (TCP + Real)")
     print("=" * 60)
 
     # ---------- 1. Сбор ----------
     all_links = set()
     for src in SOURCES:
-        print(f"[*] Читаю источник: {src}")
+        print(f"[*] Источник: {src}")
         nodes = get_nodes(src)
-        print(f"    → найдено {len(nodes)} ссылок")
+        print(f"    → {len(nodes)} ссылок")
         all_links.update(nodes)
 
     all_links = list(all_links)
-    print(f"\n[+] Всего уникальных узлов: {len(all_links)}")
+    print(f"\n[+] Уникальных узлов: {len(all_links)}")
 
     if not all_links:
-        print("[!] Нет ни одной ссылки. Создаю пустой sub.txt")
+        open("sub.txt", "w").close()
+        print("[!] Нет ссылок")
+        return
+
+    if len(all_links) > MAX_NODES_COLLECT:
+        all_links = all_links[:MAX_NODES_COLLECT]
+        print(f"[*] Ограничил до {MAX_NODES_COLLECT}")
+
+    # ---------- 2. Быстрый TCP-фильтр ----------
+    print(f"\n[*] TCP-проверка {len(all_links)} узлов ({TCP_WORKERS} потоков)...")
+    tcp_alive = []
+
+    with ThreadPoolExecutor(max_workers=TCP_WORKERS) as executor:
+        futures = {executor.submit(tcp_check, link): link for link in all_links}
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res:
+                tcp_alive.append(res)
+
+    # Сортируем по задержке
+    tcp_alive.sort(key=lambda x: x[1])
+    print(f"[+] Живых по TCP: {len(tcp_alive)}")
+
+    if not tcp_alive:
+        print("[!] Даже по TCP ничего не ответило. sub.txt пустой.")
         open("sub.txt", "w").close()
         return
 
-    # Ограничиваем количество (иначе тест будет слишком долгим)
-    if len(all_links) > MAX_NODES_TO_TEST:
-        print(f"[*] Слишком много узлов ({len(all_links)}). Берём первые {MAX_NODES_TO_TEST}")
-        all_links = all_links[:MAX_NODES_TO_TEST]
+    # Берём лучших по TCP для реального теста
+    candidates = [link for link, _ in tcp_alive[:MAX_NODES_REAL_TEST]]
+    print(f"[*] На реальный тест идёт: {len(candidates)} лучших по TCP")
 
     with open("raw_nodes.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(all_links))
+        f.write("\n".join(candidates))
 
-    # ---------- 2. Скачиваем LiteSpeedTest ----------
+    # ---------- 3. Реальный тест (LiteSpeedTest) ----------
     print("\n[*] Скачиваю LiteSpeedTest...")
-    bin_url = "https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz"
-    if not download_file(bin_url, "lite.gz"):
-        print("[!] Не удалось скачать бинарник. Выход.")
-        open("sub.txt", "w").close()
+    if not download_file(
+        "https://github.com/xxf098/LiteSpeedTest/releases/download/v0.15.0/lite-linux-amd64-v0.15.0.gz",
+        "lite.gz"
+    ):
+        # Если не скачался — отдаём топ по TCP
+        top = [link for link, _ in tcp_alive[:TOP_N]]
+        with open("sub.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(top) + "\n")
+        print(f"[!] LiteSpeedTest не скачался. Отдал топ-{len(top)} по TCP")
         return
 
     with gzip.open("lite.gz", "rb") as f_in, open("lite", "wb") as f_out:
         shutil.copyfileobj(f_in, f_out)
     os.chmod("lite", 0o755)
 
-    # geoip/geosite (на всякий случай)
     download_file("https://github.com/v2fly/geoip/releases/latest/download/geoip.dat", "geoip.dat")
     download_file("https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat", "geosite.dat")
 
-    # ---------- 3. Конфиг для реального теста ----------
     config = {
         "group": "auto",
-        "speedtestMode": "pingonly",      # только пинг (быстро)
-        "pingMethod": "googleping",       # реальный HTTP через прокси (не tcping!)
-        "sortMethod": "ping",             # сортировка по пингу
-        "concurrency": CONCURRENCY,
+        "speedtestMode": "pingonly",
+        "pingMethod": "googleping",      # реальный тест
+        "sortMethod": "ping",
+        "concurrency": CONCURRENCY_REAL,
         "testMode": 2,
-        "timeout": 8000,                  # 8 сек на один узел
+        "timeout": 9000,
         "language": "en",
-        "fontSize": 24,
-        "theme": "rainbow",
         "unique": True,
-        "generatePicMode": 0,
-        "outputMode": 4                   # 4 = txt с рабочими ссылками
+        "outputMode": 4
     }
+    with open("config.json", "w") as f:
+        json.dump(config, f)
 
-    with open("config.json", "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    print(f"[*] Реальный тест (googleping), concurrency={CONCURRENCY_REAL}...")
+    print("    Жди 3–6 минут...\n")
 
-    print(f"[*] Запускаю тест (concurrency={CONCURRENCY}, timeout={TEST_TIMEOUT_SECONDS}s)...")
-    print("    Это может занять 3–7 минут...\n")
-
-    # ---------- 4. Запуск с таймаутом ----------
     try:
-        result = subprocess.run(
+        proc = subprocess.run(
             ["./lite", "--config", "config.json", "--test", "raw_nodes.txt"],
-            timeout=TEST_TIMEOUT_SECONDS,
+            timeout=REAL_TEST_TIMEOUT,
             capture_output=True,
             text=True
         )
-        # Показываем важные куски лога
-        if result.stdout:
-            lines = result.stdout.strip().splitlines()
-            print("--- STDOUT (последние 30 строк) ---")
-            for line in lines[-30:]:
-                print(line)
-        if result.stderr:
-            print("--- STDERR ---")
-            print(result.stderr[-2000:])
+        # Показываем хвост лога
+        if proc.stdout:
+            print("--- последние строки stdout ---")
+            print("\n".join(proc.stdout.strip().splitlines()[-15:]))
+        if proc.stderr:
+            print("--- stderr (хвост) ---")
+            print(proc.stderr[-1500:])
     except subprocess.TimeoutExpired:
-        print(f"[!] Тест превысил {TEST_TIMEOUT_SECONDS} секунд и был принудительно остановлен")
+        print(f"[!] Реальный тест превысил {REAL_TEST_TIMEOUT}s, принудительно остановлен")
     except Exception as e:
-        print(f"[!] Ошибка запуска lite: {e}")
+        print(f"[!] Ошибка lite: {e}")
 
-    # ---------- 5. Ищем результат ----------
-    # LiteSpeedTest создаёт файлы вида out-*.txt или просто *.txt
-    candidates = []
+    # ---------- 4. Парсим результат реального теста ----------
+    real_working = []
     for f in glob.glob("*.txt"):
         if f in ("raw_nodes.txt", "sub.txt"):
             continue
-        candidates.append(f)
+        try:
+            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("vless://"):
+                        real_working.append(line)
+        except Exception:
+            pass
 
-    working_nodes = []
+    # Убираем дубли
+    real_working = list(dict.fromkeys(real_working))
+    print(f"\n[+] Прошли РЕАЛЬНЫЙ тест (googleping): {len(real_working)}")
 
-    if candidates:
-        # Берём самый свежий
-        latest = max(candidates, key=os.path.getmtime)
-        print(f"\n[*] Найден отчёт: {latest}")
-        with open(latest, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("vless://"):
-                    working_nodes.append(line)
+    # ---------- 5. Формируем итоговый sub.txt ----------
+    if real_working:
+        final = real_working[:TOP_N]
+        source = "real googleping"
     else:
-        print("\n[!] Файл отчёта не найден. Возможно все узлы отвалились или lite упал.")
-
-    print(f"\n[+] Рабочих узлов после реального теста: {len(working_nodes)}")
-
-    # ---------- 6. Сохраняем топ ----------
-    top = working_nodes[:TOP_N]
+        # Фоллбэк — лучшие по TCP
+        final = [link for link, _ in tcp_alive[:TOP_N]]
+        source = "TCP fallback (реальных не нашлось)"
 
     with open("sub.txt", "w", encoding="utf-8") as f:
-        if top:
-            f.write("\n".join(top) + "\n")
-            print(f"[✓] sub.txt обновлён — сохранено {len(top)} лучших серверов")
-        else:
-            # Даже если 0 — создаём пустой файл, чтобы workflow не падал
-            f.write("")
-            print("[!] Рабочих серверов нет. sub.txt создан пустым.")
+        f.write("\n".join(final) + "\n")
 
-    # Для отладки показываем первые несколько
-    if top:
-        print("\n--- Топ серверов ---")
-        for i, node in enumerate(top[:5], 1):
-            print(f"{i}. {node[:90]}...")
+    print(f"[✓] sub.txt сохранён ({len(final)} серверов) — источник: {source}")
+
+    if final:
+        print("\nПримеры:")
+        for i, node in enumerate(final[:3], 1):
+            print(f"  {i}. {node[:100]}...")
 
 
 if __name__ == "__main__":
