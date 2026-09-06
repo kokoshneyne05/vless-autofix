@@ -1,1 +1,46 @@
+name: Update VLESS Nodes
 
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # каждые 4 часа
+  workflow_dispatch:        # можно запускать вручную
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15     # защита от бесконечного зависания
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run collector + tester
+        run: |
+          python -u main.py
+        env:
+          PYTHONUNBUFFERED: 1
+
+      - name: Commit & Push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Всегда есть sub.txt (даже пустой)
+          git add sub.txt
+          
+          # Коммитим только если есть изменения
+          if git diff --staged --quiet; then
+            echo "Нет изменений в sub.txt"
+          else
+            git commit -m "Автообновление VLESS $(date -u +%Y-%m-%d_%H:%M)"
+            git push
+            echo "Успешно запушено"
+          fi
